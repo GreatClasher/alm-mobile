@@ -30,6 +30,8 @@ const PAYLOAD_TYPE_MAP: Readonly<Record<number, PacketPayloadType>> = {
   0x02: 'HEARTBEAT',
   0x03: 'CONTROL',
   0x04: 'DIAGNOSTIC',
+  0x05: 'ACTIVE_QUERY',
+  0x06: 'ACTIVE_QUERY_END',
 } as const;
 
 /**

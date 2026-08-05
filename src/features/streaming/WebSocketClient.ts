@@ -21,21 +21,36 @@ export class WebSocketClient {
     const wsUrl = process.env.EXPO_PUBLIC_WS_URL || 'ws://localhost:3000';
     this.isIntentionalDisconnect = false;
 
-    logger.info({ wsUrl }, 'Connecting to WebSocket...');
     const token = useConnectionStore.getState().authToken;
     if (!token) {
-      logger.error('No auth token available for WebSocket connection');
+      logger.error('No auth token available for WebSocket connection — will retry after token refresh');
+      // Kick off a refresh, then reconnect once we have a token
+      DeviceAuthManager.refreshToken()
+        .then(() => this.connect())
+        .catch(err => logger.error({ err }, 'Token refresh failed, cannot connect WS'));
       return;
     }
+
+    logger.info({ wsUrl }, 'Connecting to WebSocket...');
 
     this.socket = io(`${wsUrl}/device`, {
       transports: ['websocket'],
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 30000,
-      auth: {
-        token
-      }
+      // Use a callback instead of a static object so socket.io fetches
+      // the LATEST token on every reconnect attempt (not just the first).
+      auth: (cb: (data: object) => void) => {
+        const currentToken = useConnectionStore.getState().authToken;
+        if (currentToken) {
+          cb({ token: currentToken });
+        } else {
+          // Token gone mid-session — refresh then callback
+          DeviceAuthManager.refreshToken()
+            .then(newToken => cb({ token: newToken }))
+            .catch(() => cb({ token: '' }));
+        }
+      },
     });
 
     this.socket.on('connect', this.handleConnect.bind(this));
@@ -43,6 +58,23 @@ export class WebSocketClient {
     this.socket.on('connect_error', this.handleConnectError.bind(this));
     this.socket.on('auth_error', (error: { message: string }) => {
       this.handleConnectError(new Error(error?.message || 'jwt expired'));
+    });
+
+    this.socket.on('assistant:response', (payload: { answer: string, prompt?: string }) => {
+      logger.info({ payload }, 'Received assistant response');
+      const { setFastLaneStage, setAssistantMessage, setAssistantPrompt } = useConnectionStore.getState();
+      
+      setAssistantMessage(payload.answer);
+      if (payload.prompt) {
+        setAssistantPrompt(payload.prompt);
+      }
+      setFastLaneStage('answering');
+      
+      // Clear stage after showing answer
+      setTimeout(() => {
+        setFastLaneStage('done');
+        setTimeout(() => setFastLaneStage('idle'), 3000);
+      }, 5000);
     });
   }
 
@@ -55,6 +87,9 @@ export class WebSocketClient {
       throw new WebSocketSendError('not connected');
     }
 
+    const { addPttLog, incrementPacketsSent } = useConnectionStore.getState();
+    const byteSize = packet.payload?.length;
+
     return new Promise((resolve, reject) => {
       const jsonPacket = {
         ...packet,
@@ -64,14 +99,18 @@ export class WebSocketClient {
       this.socket!.timeout(5000).emit('audio:packet', jsonPacket, (err: Error | null, response: any) => {
         if (err) {
           logger.error({ error: err }, 'WebSocket send timeout');
+          addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'error', byteSize });
           return reject(new WebSocketSendError('timeout'));
         }
 
         if (response?.status === 'rejected') {
           logger.error({ response }, 'Packet rejected by server');
+          addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'error', byteSize });
           return reject(new WebSocketSendError('rejected'));
         }
 
+        incrementPacketsSent();
+        addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'ok', packetId: response?.packetId, byteSize });
         resolve(response);
       });
     });
@@ -82,6 +121,8 @@ export class WebSocketClient {
       throw new WebSocketSendError('not connected');
     }
 
+    const { addPttLog, incrementPacketsSent } = useConnectionStore.getState();
+
     return new Promise((resolve, reject) => {
       const batch = packets.map(p => ({
         ...p,
@@ -91,11 +132,23 @@ export class WebSocketClient {
       this.socket!.timeout(10000).emit('audio:packets:batch', { packets: batch }, (err: Error | null, response: any) => {
         if (err) {
           logger.error({ error: err }, 'WebSocket batch send timeout');
+          // Log each packet in the batch as failed
+          for (const p of packets) {
+            addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'error', byteSize: p.payload?.length });
+          }
           return reject(new WebSocketSendError('timeout'));
         }
         if (response?.status === 'rejected') {
           logger.error({ response }, 'Packet batch rejected by server');
+          for (const p of packets) {
+            addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'error', byteSize: p.payload?.length });
+          }
           return reject(new WebSocketSendError('rejected'));
+        }
+        // Success — log each packet as sent
+        for (const p of packets) {
+          incrementPacketsSent();
+          addPttLog({ timestamp: Date.now(), direction: 'sent', status: 'ok', byteSize: p.payload?.length });
         }
         resolve(response);
       });
@@ -163,23 +216,16 @@ export class WebSocketClient {
     logger.error({ error }, 'WebSocket connection error');
     useConnectionStore.getState().setWsConnected(false);
 
-    // If it's an authentication error (e.g., token expired)
-    if (error.message.toLowerCase().includes('unauthorized') || error.message.toLowerCase().includes('jwt')) {
-      logger.warn('WebSocket authentication failed. Attempting to refresh token...');
-      DeviceAuthManager.refreshToken().then((newToken) => {
-        if (this.socket) {
-          logger.info('Got new token from refresh, updating socket and reconnecting');
-          // Safely update the socket's auth token for future reconnection attempts
-          if (this.socket.auth && typeof this.socket.auth === 'object') {
-            (this.socket.auth as any).token = newToken;
-          } else {
-            this.socket.auth = { token: newToken };
-          }
-          this.socket.connect();
-        }
-      }).catch(err => {
-        logger.error({ err }, 'Failed to refresh token during WS reconnect');
-      });
+    const msg = error.message.toLowerCase();
+    const isAuthError = msg.includes('unauthorized') || msg.includes('jwt') || msg.includes('missing token') || msg.includes('401');
+
+    if (isAuthError) {
+      logger.warn('WebSocket auth error — re-initializing device auth (full re-register if needed)');
+      // initialize() checks the stored token; if expired or missing it calls registerDevice()
+      // The auth callback will pick up the fresh token on the next auto-reconnect.
+      DeviceAuthManager.initialize().catch(err =>
+        logger.error({ err }, 'Failed to re-initialize auth during WS reconnect'),
+      );
     }
   }
 }

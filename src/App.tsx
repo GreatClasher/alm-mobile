@@ -1,17 +1,18 @@
 import React, { useEffect, useState } from 'react';
-import { DeviceEventEmitter, Modal, View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { DeviceEventEmitter, Modal, View, Text, TouchableOpacity, StyleSheet, PermissionsAndroid, Platform } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AppNavigator } from './navigation/AppNavigator';
 import { SqlitePacketQueue } from './features/storage/SqlitePacketQueue';
 import { useConnectionStore } from './stores/connectionStore';
-import { BleConnectionService } from './features/bluetooth/services/BleConnectionService';
-import { BlePacketService } from './features/bluetooth/services/BlePacketService';
+import * as AlmAudioService from '../modules/alm-audio-service';
+import { deserializePacket } from './features/bluetooth/utils/packet-deserializer';
+import { verifyChecksum } from './shared/utils/checksum';
+import { Buffer } from 'buffer';
 import { WebSocketClient } from './features/streaming/WebSocketClient';
 import { PacketRelayService } from './features/streaming/PacketRelayService';
 import { NetworkMonitor } from './features/streaming/NetworkMonitor';
 import { BleConnectionState } from './features/bluetooth/types/BleConnectionState';
 import { MobileLogger } from './shared/utils/logger';
-import { HeartbeatForwarder } from './features/heartbeat/HeartbeatForwarder';
 import { OtaCoordinator } from './features/ota/OtaCoordinator';
 import { DeviceAuthManager } from './features/auth/DeviceAuthManager';
 import { HealthSyncService } from './features/health/HealthSyncService';
@@ -23,12 +24,14 @@ const logger = new MobileLogger('App');
 export default function App() {
   const [showPermissionModal, setShowPermissionModal] = useState(false);
 
-  const { 
-    setBleState, 
-    setWsConnected, 
+  const {
+    setBleState,
+    setWsConnected,
     setPendingPacketCount,
-    setLastHeartbeatAt,
     incrementPacketsReceived,
+    incrementPacketsSent,
+    addPttLog,
+    setFastLaneStage,
   } = useConnectionStore();
 
   useEffect(() => {
@@ -67,64 +70,138 @@ export default function App() {
     const wsClient = new WebSocketClient();
     const relayService = new PacketRelayService(sqliteQueue, wsClient, new MobileLogger('PacketRelay'));
     const networkMonitor = new NetworkMonitor();
-    const bleConnection = new BleConnectionService();
-    const blePacket = new BlePacketService();
-    const heartbeatForwarder = new HeartbeatForwarder(new MobileLogger('HeartbeatForwarder'));
 
-    const connectBle = () => {
-      logger.info('connectBle() called — initiating BLE connection cycle');
-      bleConnection.disconnect();
-      setBleState(BleConnectionState.SCANNING);
-      bleConnection.connect({
-        onConnected: (device, hardwareId) => {
-          logger.info({ deviceId: device.id, hardwareId }, 'BLE connected — starting packet monitoring');
-          setBleState(BleConnectionState.CONNECTED);
-
-          // Pass the full Device object so BlePacketService can call
-          // device.monitorCharacteristicForService() — which writes the CCCD descriptor
-          // directly without doing an internal read on a NOTIFY-only characteristic.
-          blePacket.startMonitoring(device, {
-            onPacketReceived: async (packet) => {
-              logger.debug(
-                { payloadType: packet.payloadType, sequenceNo: packet.sequenceNo },
-                'Packet received from watch'
-              );
-              incrementPacketsReceived();
-              if (packet.payloadType === 'HEARTBEAT') {
-                logger.info('Heartbeat packet received — forwarding to backend');
-                setLastHeartbeatAt(Date.now());
-                const pendingCount = await sqliteQueue.getPendingCount();
-                await heartbeatForwarder.forwardHeartbeat(packet, true, pendingCount);
-              } else if (packet.payloadType === 'AUDIO') {
-                logger.debug('Audio packet received — enqueuing for relay');
-                await sqliteQueue.enqueue(packet);
-              } else {
-                logger.warn({ payloadType: packet.payloadType }, 'Unknown packet payload type — dropping');
-              }
-            },
-            onError: (error) => {
-              logger.error({ error }, 'Error in packet stream');
-              blePacket.stopMonitoring();
-            }
-          });
-        },
-        onDisconnected: () => {
-          logger.info('BLE disconnected — stopping packet monitoring, entering RECONNECTING state');
-          setBleState(BleConnectionState.RECONNECTING);
-          blePacket.stopMonitoring();
-        },
-        onError: (error) => {
-          logger.error({ error }, 'BLE connection error — entering DISCONNECTED state');
-          setBleState(BleConnectionState.DISCONNECTED);
+    // Register Native listeners for non-audio packets
+    const blePacketSub = AlmAudioService.addBlePacketListener(async (event) => {
+      try {
+        const raw = Buffer.from(event.data, 'base64');
+        const packet = deserializePacket(raw);
+        if (!verifyChecksum(packet.payload, packet.checksum)) {
+          logger.warn('Checksum failed natively');
+          return;
         }
+
+        incrementPacketsReceived();
+        addPttLog({
+          timestamp: Date.now(),
+          direction: 'received',
+          status: 'ok',
+          byteSize: packet.payload?.length,
+        });
+
+        if (packet.payloadType !== 'HEARTBEAT' && packet.payloadType !== 'ACTIVE_QUERY' && packet.payloadType !== 'ACTIVE_QUERY_END') {
+          logger.warn({ payloadType: packet.payloadType }, 'Unknown packet payload type from native — dropping');
+        }
+      } catch (err) {
+        logger.warn('Failed to parse native BLE packet');
+      }
+    });
+
+    const assistantSub = AlmAudioService.addAssistantResponseListener((event) => {
+      logger.info({ answer: event.answer }, 'Assistant responded from native socket');
+      useConnectionStore.getState().setAssistantMessage(event.answer);
+      if (event.prompt) {
+        useConnectionStore.getState().setAssistantPrompt(event.prompt);
+      }
+      useConnectionStore.getState().setFastLaneStage('answering');
+      
+      // Auto-reset to done then idle
+      setTimeout(() => {
+        useConnectionStore.getState().setFastLaneStage('done');
+        setTimeout(() => {
+           useConnectionStore.getState().setFastLaneStage('idle');
+        }, 3000);
+      }, 5000);
+    });
+
+    let fastLaneTimeout: NodeJS.Timeout | null = null;
+    let uploadingTimeout: NodeJS.Timeout | null = null;
+
+    const audioPacketSub = AlmAudioService.addAudioPacketListener((event: any) => {
+      incrementPacketsReceived();
+      addPttLog({
+        timestamp: Date.now(),
+        direction: 'received',
+        status: 'ok',
+        byteSize: event.byteSize,
+      });
+
+      if (event.type === 5) { // ACTIVE_QUERY — PTT pressed, audio flowing in
+        // Stage: listening
+        setFastLaneStage('listening');
+        useConnectionStore.getState().setFastLaneActive(true);
+
+        // After a short quiet period assume uploading has started
+        if (uploadingTimeout) clearTimeout(uploadingTimeout);
+        uploadingTimeout = setTimeout(() => {
+          const stage = useConnectionStore.getState().fastLaneStage;
+          if (stage === 'listening') setFastLaneStage('uploading');
+        }, 800);
+
+        if (fastLaneTimeout) clearTimeout(fastLaneTimeout);
+        fastLaneTimeout = setTimeout(() => {
+          useConnectionStore.getState().setFastLaneActive(false);
+          // Move to processing if still uploading
+          const stage = useConnectionStore.getState().fastLaneStage;
+          if (stage === 'uploading' || stage === 'listening') setFastLaneStage('processing');
+        }, 1500);
+      } else if (event.type === 6) { // ACTIVE_QUERY_END — PTT released
+        if (uploadingTimeout) clearTimeout(uploadingTimeout);
+        if (fastLaneTimeout) clearTimeout(fastLaneTimeout);
+        useConnectionStore.getState().setFastLaneActive(false);
+        const stage = useConnectionStore.getState().fastLaneStage;
+        if (stage === 'uploading' || stage === 'listening') setFastLaneStage('processing');
+      }
+    });
+
+    // Sent events for real-time Fast Lane / Audio packets come from native socket
+    const audioPacketSentSub = AlmAudioService.addAudioPacketSentListener(() => {
+      incrementPacketsSent();
+      addPttLog({
+        timestamp: Date.now(),
+        direction: 'sent',
+        status: 'ok',
+      });
+    });
+
+    const connectBle = async () => {
+      logger.info('connectBle() called — starting native ALM Audio service');
+      setBleState(BleConnectionState.SCANNING);
+
+      if (Platform.OS === 'android' && Platform.Version >= 31) {
+        await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        ]);
+      } else if (Platform.OS === 'android') {
+        await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+      }
+
+      
+      const wsBaseUrl = process.env.EXPO_PUBLIC_WS_URL || 'ws://192.168.1.10:3000';
+      const config = {
+        deviceId: useConnectionStore.getState().hardwareId || 'default-device',
+        userId: 'native-user',
+        wsUrl: `${wsBaseUrl}/device`,
+        token: useConnectionStore.getState().authToken || '',
+        porcupineAccessKey: 'INSERT_YOUR_ACCESS_KEY_HERE'
+      };
+
+      AlmAudioService.startService(config).then(() => {
+        logger.info('Native BLE connected');
+        setBleState(BleConnectionState.CONNECTED);
+      }).catch(err => {
+        logger.error({ err }, 'Native BLE connection failed');
+        setBleState(BleConnectionState.DISCONNECTED);
       });
     };
 
-    const reconnectListener = DeviceEventEmitter.addListener('MANUAL_RECONNECT', () => {
+    const reconnectListener = DeviceEventEmitter.addListener('MANUAL_RECONNECT', async () => {
       logger.info('Manual reconnect triggered');
       wsClient.disconnect();
       wsClient.connect();
-      connectBle();
+      AlmAudioService.stopService();
+      await connectBle();
     });
 
     const backgroundTask = async (taskDataArguments: any) => {
@@ -169,7 +246,7 @@ export default function App() {
           }
         });
 
-        connectBle();
+        await connectBle();
 
         // Keep task running and perform periodic maintenance
         while (BackgroundJob.isRunning()) {
@@ -215,8 +292,11 @@ export default function App() {
       logger.info('Tearing down App Services');
       reconnectListener.remove();
       if (cleanupInitialize) cleanupInitialize();
-      blePacket.stopMonitoring();
-      bleConnection.disconnect();
+      blePacketSub.remove();
+      assistantSub.remove();
+      audioPacketSub.remove();
+      audioPacketSentSub.remove();
+      AlmAudioService.stopService();
       networkMonitor.stopMonitoring();
       wsClient.disconnect();
     };

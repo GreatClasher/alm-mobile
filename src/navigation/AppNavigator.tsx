@@ -1,11 +1,12 @@
 import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { Activity, Clock, FileAudio } from 'lucide-react-native';
+import { Activity, Clock, FileAudio, Bot } from 'lucide-react-native';
 
 import { StatusScreen } from '../screens/StatusScreen';
 import { SessionsNavigator } from './SessionsNavigator';
 import { HealthScreen } from '../screens/Health/HealthScreen';
+import { AssistantScreen } from '../screens/Assistant/AssistantScreen';
 
 const Tab = createBottomTabNavigator();
 
@@ -31,6 +32,13 @@ export function AppNavigator() {
           component={StatusScreen}
           options={{
             tabBarIcon: ({ color, size }) => <Activity color={color} size={size} />,
+          }}
+        />
+        <Tab.Screen
+          name="Assistant"
+          component={AssistantScreen}
+          options={{
+            tabBarIcon: ({ color, size }) => <Bot color={color} size={size} />,
           }}
         />
         <Tab.Screen

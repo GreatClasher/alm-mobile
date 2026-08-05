@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { BleConnectionState } from '../types/BleConnectionState';
-import { BleConnectionService } from '../services/BleConnectionService';
+import * as AlmAudioService from '../../../../../modules/alm-audio-service';
 import { MobileLogger } from '@/shared/utils/logger';
 
 const logger = new MobileLogger('useBluetoothConnection');
@@ -9,39 +9,47 @@ export function useBluetoothConnection() {
   const [state, setState] = useState<BleConnectionState>(BleConnectionState.DISCONNECTED);
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [error, setError] = useState<Error | null>(null);
-  const serviceRef = useRef<BleConnectionService | null>(null);
 
   useEffect(() => {
-    logger.info('Initializing BleConnectionService in hook');
-    const service = new BleConnectionService();
-    serviceRef.current = service;
+    logger.info('Initializing AlmAudioService Native Module in hook');
+    
+    // Default configs for now, these would typically come from auth/env
+    const config = {
+      deviceId: 'native-device-id', 
+      userId: 'native-user-id',
+      wsUrl: 'ws://192.168.1.10:3000', // Update with actual backend URL
+      porcupineAccessKey: 'INSERT_YOUR_ACCESS_KEY_HERE' 
+    };
 
-    setState(BleConnectionState.SCANNING);
-    setError(null);
-
-    service.connect({
-      onConnected: (device, hardwareId: string) => {
-        logger.info({ hardwareId }, 'Connected via hook');
-        setDeviceName(device.name || hardwareId);
+    // Start native service
+    AlmAudioService.startService(config)
+      .then(() => {
         setState(BleConnectionState.CONNECTED);
+        setDeviceName('ALM Native Audio');
         setError(null);
-      },
-      onDisconnected: () => {
-        logger.warn('Disconnected via hook');
-        setState(BleConnectionState.RECONNECTING);
-        setDeviceName(null);
-      },
-      onError: (err: Error) => {
-        logger.error({ error: err }, 'Error in hook');
+      })
+      .catch((err) => {
+        logger.error({ error: err }, 'Native service start failed');
         setError(err);
         setState(BleConnectionState.DISCONNECTED);
-      }
+      });
+
+    // Listen to native events
+    const wakeSub = AlmAudioService.addWakeWordDetectedListener(() => {
+      logger.info('Wake word detected natively!');
+      // Update UI state here if needed (e.g. showing "Listening...")
+    });
+
+    const responseSub = AlmAudioService.addAssistantResponseListener((event) => {
+      logger.info({ answer: event.answer }, 'Assistant response received natively!');
+      // Update UI state or trigger TTS here
     });
 
     return () => {
-      logger.info('Cleaning up BleConnectionService in hook');
-      service.disconnect();
-      serviceRef.current = null;
+      logger.info('Cleaning up AlmAudioService in hook');
+      AlmAudioService.stopService();
+      wakeSub.remove();
+      responseSub.remove();
     };
   }, []);
 

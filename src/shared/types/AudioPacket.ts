@@ -9,6 +9,8 @@ export const PacketPayloadType = {
   HEARTBEAT: 'HEARTBEAT',
   CONTROL: 'CONTROL',
   DIAGNOSTIC: 'DIAGNOSTIC',
+  ACTIVE_QUERY: 'ACTIVE_QUERY',
+  ACTIVE_QUERY_END: 'ACTIVE_QUERY_END',
 } as const;
 export type PacketPayloadType = (typeof PacketPayloadType)[keyof typeof PacketPayloadType];
 
