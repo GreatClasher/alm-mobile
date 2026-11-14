@@ -1,16 +1,62 @@
-node_modules
-
+# Node dependencies
 node_modules/
-.expo/
-dist/
 npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# Expo & Metro
+.expo/
+.expo-shared/
+web-build/
+dist/
+
+# Android build outputs & caches
+android/app/build/
+android/.gradle/
+android/build/
+build/
+**/build/
+*.apk
+*.aab
+*.dex
+*.class
+
+# Native build transforms & intermediates
+**/intermediates/
+**/transforms/
+**/.transforms/
+**/outputs/
+
+# Keystores & Signing secrets
 *.jks
 *.p8
 *.p12
 *.key
+*.keystore
 *.mobileprovision
-*.orig.*
+
+# Environment & Config
+.env
+.env.*
+!.env.example
+
+# Logs and debug traces
+*.log
+*.logcat
+logcat.txt
+crash*.log
+crash*.txt
+logs*.txt
+test.log
+
+# Coverage & Testing
+coverage/
+.nyc_output/
+
+# IDE & OS
 .idea/
 *.iml
+.vscode/
 .DS_Store
-.env
+Thumbs.db
+%ProgramData%/
